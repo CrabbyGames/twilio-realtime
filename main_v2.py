@@ -124,6 +124,7 @@ async def run_monitoring_agent(call_sid, audio_queue):
                                     probability = result["probability"]
                                     print(f"Scam probability: {probability}, Reason: {result['reason']}")
                                     if probability >= SCAM_THRESHOLD:
+                                        save_transcript(call_sid)
                                         with terminate_calls_lock:
                                             terminate_calls[call_sid] = True
                                         twilio_client.calls(call_sid).update(status="completed")
@@ -246,6 +247,7 @@ async def handle_media_stream(websocket: WebSocket):
                                     ],
                                 },
                             }
+                            save_transcript(call_sid)
                             await openai_ws.send(json.dumps(termination_item))
                             await openai_ws.send(json.dumps({"type": "response.create"}))
                             await asyncio.sleep(2)  # Ensure message is sent
