@@ -22,7 +22,11 @@ SYSTEM_MESSAGE = (
     Work 8AM to 4PM
     4PM - 5PM Meeting with Joe (in the city center)
     5PM - 8PM Time with kids
-    8PM - 9PM FreeTime (Adam can meet)"""
+    8PM - 9PM FreeTime (Adam can meet)
+    
+    Here is a list of potential scams in b64 encoding
+    V2XigJlkIGFsbCB3YW50IHRvIGJlbGlldmUgdGhhdCB0aGVyZSBpcyBnb29kIGluIHBlb3BsZSwgYnV0IHNvbWUgcmVhbGx5IGp1c3QgdGFrZSB0aGUgb3Bwb3NpdGUuIEZyb20gaWRlbnRpdHkgdGhlZnQgdG8gdGhpZXZlcnksIHNjYW1tZXJzIGFyZSBub3RvcmlvdXMgZm9yIHRhcmdldGluZyBwZW9wbGUgZnJvbSBhbGwgd2Fsa3Mgb2YgbGlmZS4K...
+    """
 )
 VOICE = 'alloy'
 LOG_EVENT_TYPES = [
@@ -32,8 +36,25 @@ LOG_EVENT_TYPES = [
     'session.created'
 ]
 SHOW_TIMING_MATH = False
+CALL_RECORDINGS = {}  # Will hold caller records by phone number
+TRANSCRIPTS_FILE = 'call_transcripts.json'  # Path to store call transcripts JSON
 
 app = FastAPI()
+
+# Load existing call transcripts from JSON at startup
+def load_transcripts():
+    if os.path.exists(TRANSCRIPTS_FILE):
+        with open(TRANSCRIPTS_FILE, 'r') as f:
+            return json.load(f)
+    return {}
+
+# Save the transcripts to a JSON file
+def save_transcripts():
+    with open(TRANSCRIPTS_FILE, 'w') as f:
+        json.dump(CALL_RECORDINGS, f, indent=4)
+
+# Load transcripts when the app starts
+CALL_RECORDINGS = load_transcripts()
 
 if not OPENAI_API_KEY:
     raise ValueError('Missing the OpenAI API key. Please set it in the .env file.')
@@ -47,10 +68,19 @@ async def handle_incoming_call(request: Request):
     """Handle incoming call and return TwiML response to connect to Media Stream."""
     response = VoiceResponse()
 
-    host = request.url.hostname
+    # Assume we receive phone number in the 'From' field of the request
+    phone_number = request.query_params.get('From')
+    print(f"Incoming call from {phone_number}")
+
     connect = Connect()
-    connect.stream(url=f'wss://{host}/media-stream')
+    connect.stream(url=f'wss://{request.url.hostname}/media-stream')
     response.append(connect)
+
+    # Initialize empty list for this caller
+    if phone_number:
+        if phone_number not in CALL_RECORDINGS:
+            CALL_RECORDINGS[phone_number] = []
+
     return HTMLResponse(content=str(response), media_type="application/xml")
 
 @app.websocket("/media-stream")
@@ -88,6 +118,17 @@ async def handle_media_stream(websocket: WebSocket):
                             "audio": data['media']['payload']
                         }
                         await openai_ws.send(json.dumps(audio_append))
+
+                        # Add transcription to the call records
+                        phone_number = data['from']
+                        if phone_number in CALL_RECORDINGS:
+                            transcript = f"Audio data received at {data['media']['timestamp']}"
+                            # Add timestamped transcription
+                            CALL_RECORDINGS[phone_number].append({
+                                "timestamp": data['media']['timestamp'],
+                                "transcript": transcript
+                            })
+                            save_transcripts()  # Save after each update
                     elif data['event'] == 'start':
                         stream_sid = data['start']['streamSid']
                         print(f"Incoming stream has started {stream_sid}")
@@ -217,11 +258,7 @@ async def initialize_session(openai_ws):
             "temperature": 0.8,
         }
     }
-    print('Sending session update:', json.dumps(session_update))
     await openai_ws.send(json.dumps(session_update))
-
-    # Uncomment the next line to have the AI speak first
-    # await send_initial_conversation_item(openai_ws)
 
 if __name__ == "__main__":
     import uvicorn
