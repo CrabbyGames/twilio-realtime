@@ -1,13 +1,15 @@
 import uvicorn
-from config.settings import Settings
 from dotenv import load_dotenv
 from fastapi import FastAPI
-from routes import call_routes, websocket_routes
-from services.twilio_service import TwilioService
+
+load_dotenv()
+
+from phone_defender.config.settings import Settings
+from phone_defender.routes import call_routes, websocket_routes
+from phone_defender.services.twilio_service import TwilioService
 
 
 def create_app():
-    load_dotenv()
     settings = Settings()
 
     app = FastAPI()

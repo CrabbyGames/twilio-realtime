@@ -1,6 +1,6 @@
 import json
 
-from config.settings import Settings
+from phone_defender.config.settings import Settings
 
 
 class OpenAIService:

@@ -5,7 +5,8 @@ import json
 import websockets
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from loguru import logger
-from services.openai_service import OpenAIService
+
+from phone_defender.services.openai_service import OpenAIService
 
 router = APIRouter()
 
