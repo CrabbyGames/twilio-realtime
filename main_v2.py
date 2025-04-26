@@ -21,12 +21,12 @@ TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 PORT = int(os.getenv("PORT", 5050))
 TALKATIVE_SYSTEM_MESSAGE = """
-    You are an AI voice assistant. Engage naturally with the caller. If instructed to end the call, say: 'Scam detected. This call is recorded and will be reported.' then hang up.
+    You are an AI voice assistant. Engage naturally with the caller. If instructed to end the call, say: 'Scam has been detected... this call has been recorded and will be send to authorities...' then use the hangupCall tool to end the call.
     Today's calendar:
     Work 8AM to 4PM
     4PM - 5PM Meeting with Joe (in the city center)
     5PM - 8PM Time with kids
-    8PM - 9PM Free time (can meet)"""
+    8PM - 9PM FreeTime (can meet)"""
 MONITORING_SYSTEM_MESSAGE = """
     You are a scam detection agent. Analyze the conversation audio in real-time to assess the probability (0-100%) that it is a scam. Focus on intent, tone, urgency, and requests for sensitive information (e.g., passwords, bank details). Do not generate explicit transcriptions for analysis; use the audio context directly. Output a JSON object with 'probability' (float) and 'reason' (string explaining the assessment). Collect conversation text outputs for saving as a transcript later. Example output:
     {
@@ -44,25 +44,25 @@ LOG_EVENT_TYPES = [
     "input_audio_buffer.speech_stopped",
     "input_audio_buffer.speech_started",
     "session.created",
+    "response.function_call_arguments.done",
 ]
 SHOW_TIMING_MATH = False
 SCAM_THRESHOLD = 0.9  # 90% probability threshold
 
-# Initialize Twilio client
-twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+app = FastAPI()
+twilio_client = None
+
+if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN:
+    twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+
+if not OPENAI_API_KEY:
+    raise ValueError("Missing the OpenAI API key. Please set it in the .env file.")
 
 # Thread-safe storage for transcripts and call termination flags
 transcripts = {}
 transcripts_lock = threading.Lock()
 terminate_calls = {}
 terminate_calls_lock = threading.Lock()
-
-app = FastAPI()
-
-if not OPENAI_API_KEY or not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN:
-    raise ValueError(
-        "Missing API keys. Set OPENAI_API_KEY, TWILIO_ACCOUNT_SID, and TWILIO_AUTH_TOKEN in .env file."
-    )
 
 
 def save_transcript(call_sid):
@@ -124,10 +124,8 @@ async def run_monitoring_agent(call_sid, audio_queue):
                                     probability = result["probability"]
                                     print(f"Scam probability: {probability}, Reason: {result['reason']}")
                                     if probability >= SCAM_THRESHOLD:
-                                        save_transcript(call_sid)
                                         with terminate_calls_lock:
                                             terminate_calls[call_sid] = True
-                                        twilio_client.calls(call_sid).update(status="completed")
                                         break
                             except json.JSONDecodeError:
                                 # Not a JSON object, so it's part of the conversation
@@ -139,7 +137,6 @@ async def run_monitoring_agent(call_sid, audio_queue):
 
                 # Trigger scam analysis after each speech segment
                 if response.get("type") == "input_audio_buffer.speech_stopped":
-                    # Request scam analysis based on recent audio context
                     analysis_item = {
                         "type": "conversation.item.create",
                         "item": {
@@ -166,15 +163,18 @@ async def index_page():
 
 @app.api_route("/incoming-call", methods=["GET", "POST"])
 async def handle_incoming_call(request: Request):
+    """Handle incoming call and return TwiML response to connect to Media Stream."""
     response = VoiceResponse()
+    host = request.url.hostname
     connect = Connect()
-    connect.stream(url=f"wss://{request.url.hostname}/media-stream")
+    connect.stream(url=f"wss://{host}/media-stream")
     response.append(connect)
     return HTMLResponse(content=str(response), media_type="application/xml")
 
 
 @app.websocket("/media-stream")
 async def handle_media_stream(websocket: WebSocket):
+    """Handle WebSocket connections between Twilio and OpenAI."""
     print("Client connected")
     await websocket.accept()
 
@@ -184,6 +184,7 @@ async def handle_media_stream(websocket: WebSocket):
     ) as openai_ws:
         await initialize_session(openai_ws)
 
+        # Connection specific state
         stream_sid = None
         call_sid = None
         latest_media_timestamp = 0
@@ -193,6 +194,7 @@ async def handle_media_stream(websocket: WebSocket):
         audio_queue = queue.Queue()
 
         async def receive_from_twilio():
+            """Receive audio data from Twilio and send it to the OpenAI Realtime API."""
             nonlocal stream_sid, call_sid, latest_media_timestamp
             try:
                 async for message in websocket.iter_text():
@@ -207,9 +209,8 @@ async def handle_media_stream(websocket: WebSocket):
                         audio_queue.put(data["media"]["payload"])
                     elif data["event"] == "start":
                         stream_sid = data["start"]["streamSid"]
-                        call = twilio_client.calls(data["start"]["callSid"]).fetch()
-                        call_sid = call.sid
-                        print(f"Incoming stream started {stream_sid}, call SID {call_sid}")
+                        call_sid = data["start"].get("callSid")
+                        print(f"Incoming stream started {stream_sid}, Call SID: {call_sid}")
                         asyncio.create_task(run_monitoring_agent(call_sid, audio_queue))
                         response_start_timestamp_twilio = None
                         latest_media_timestamp = 0
@@ -224,7 +225,8 @@ async def handle_media_stream(websocket: WebSocket):
                     await openai_ws.close()
 
         async def send_to_twilio():
-            nonlocal stream_sid, last_assistant_item, response_start_timestamp_twilio
+            """Receive events from the OpenAI Realtime API, send audio back to Twilio."""
+            nonlocal stream_sid, call_sid, last_assistant_item, response_start_timestamp_twilio
             try:
                 async for openai_message in openai_ws:
                     response = json.loads(openai_message)
@@ -242,15 +244,26 @@ async def handle_media_stream(websocket: WebSocket):
                                     "content": [
                                         {
                                             "type": "text",
-                                            "text": "Scam detected. This call is recorded and will be reported.",
+                                            "text": "Scam has been detected... this call has been recorded and will be send to authorities...",
                                         }
                                     ],
                                 },
                             }
-                            save_transcript(call_sid)
                             await openai_ws.send(json.dumps(termination_item))
                             await openai_ws.send(json.dumps({"type": "response.create"}))
                             await asyncio.sleep(2)  # Ensure message is sent
+                            # Trigger hangupCall tool
+                            hangup_item = {
+                                "type": "conversation.item.create",
+                                "item": {
+                                    "type": "function_call",
+                                    "call_id": f"call_{call_sid}",
+                                    "name": "hangupCall",
+                                    "arguments": {},
+                                },
+                            }
+                            await openai_ws.send(json.dumps(hangup_item))
+                            await openai_ws.send(json.dumps({"type": "response.create"}))
                             break
 
                     if response.get("type") == "response.audio.delta" and "delta" in response:
@@ -272,6 +285,25 @@ async def handle_media_stream(websocket: WebSocket):
 
                         await send_mark(websocket, stream_sid)
 
+                    # Handle function calls from the AI
+                    if response.get("type") == "response.function_call_arguments.done":
+                        function_name = response.get("name")
+                        call_id = response.get("call_id")
+
+                        if function_name == "hangupCall":
+                            success = await hangup_call(call_sid)
+                            result = {"success": success}
+                            result_message = {
+                                "type": "conversation.item.create",
+                                "item": {
+                                    "type": "function_call_output",
+                                    "call_id": call_id,
+                                    "output": json.dumps(result),
+                                },
+                            }
+                            await openai_ws.send(json.dumps(result_message))
+                            await openai_ws.send(json.dumps({"type": "response.create"}))
+
                     if response.get("type") == "input_audio_buffer.speech_started":
                         print("Speech started detected.")
                         if last_assistant_item:
@@ -282,6 +314,7 @@ async def handle_media_stream(websocket: WebSocket):
                 print(f"Error in send_to_twilio: {e}")
 
         async def handle_speech_started_event():
+            """Handle interruption when the caller's speech starts."""
             nonlocal response_start_timestamp_twilio, last_assistant_item
             print("Handling speech started event.")
             if mark_queue and response_start_timestamp_twilio is not None:
@@ -314,10 +347,27 @@ async def handle_media_stream(websocket: WebSocket):
                 await connection.send_json(mark_event)
                 mark_queue.append("responsePart")
 
+        async def hangup_call(call_sid):
+            """Hang up a Twilio call using the REST API."""
+            if not call_sid or not twilio_client:
+                print(
+                    f"Unable to hang up call: call_sid={call_sid}, client_available={twilio_client is not None}"
+                )
+                return False
+            try:
+                print(f"Hanging up call: {call_sid}")
+                call = twilio_client.calls(call_sid).update(status="completed")
+                print(f"Call status updated to: {call.status}")
+                return True
+            except Exception as e:
+                print(f"Error hanging up call: {e}")
+                return False
+
         await asyncio.gather(receive_from_twilio(), send_to_twilio())
 
 
 async def send_initial_conversation_item(openai_ws):
+    """Send initial conversation item if AI talks first."""
     initial_conversation_item = {
         "type": "conversation.item.create",
         "item": {
@@ -326,7 +376,7 @@ async def send_initial_conversation_item(openai_ws):
             "content": [
                 {
                     "type": "input_text",
-                    "text": "Greet the user with 'Hello there! I am an AI voice assistant powered by Twilio and OpenAI. How can I help you?'",
+                    "text": "Greet the user with 'Hello there! I am an AI voice assistant powered by Twilio and the OpenAI Realtime API. You can ask me for facts, jokes, or anything you can imagine. How can I help you?'",
                 }
             ],
         },
@@ -336,6 +386,7 @@ async def send_initial_conversation_item(openai_ws):
 
 
 async def initialize_session(openai_ws):
+    """Control initial session with OpenAI."""
     session_update = {
         "type": "session.update",
         "session": {
@@ -346,6 +397,14 @@ async def initialize_session(openai_ws):
             "instructions": TALKATIVE_SYSTEM_MESSAGE,
             "modalities": ["text", "audio"],
             "temperature": 0.8,
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "hangupCall",
+                    "description": "Hang up the current call when a scam is detected",
+                    "parameters": {"type": "object", "properties": {}, "required": []},
+                }
+            ],
         },
     }
     print("Sending session update:", json.dumps(session_update))
