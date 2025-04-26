@@ -287,6 +287,7 @@ async def handle_media_stream(websocket: WebSocket):
                     if result["likelihood"] == "high" or (
                         result["tool_call"] and result["tool_call"]["name"] == "EndCallTool"
                     ):
+                        
                         print("Scam detected, initiating call termination.")
                         scam_message = {
                             "type": "conversation.item.create",

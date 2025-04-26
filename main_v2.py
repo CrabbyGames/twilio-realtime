@@ -68,6 +68,7 @@ terminate_calls_lock = threading.Lock()
 def save_transcript(call_sid):
     """Save the transcript to a file."""
     with transcripts_lock:
+        print(transcripts)
         if call_sid in transcripts:
             transcript_text = " ".join(transcripts[call_sid])
             with open(f"transcript_{call_sid}.txt", "w") as f:
@@ -349,6 +350,7 @@ async def handle_media_stream(websocket: WebSocket):
 
         async def hangup_call(call_sid):
             """Hang up a Twilio call using the REST API."""
+            save_transcript(call_sid)
             if not call_sid or not twilio_client:
                 print(
                     f"Unable to hang up call: call_sid={call_sid}, client_available={twilio_client is not None}"

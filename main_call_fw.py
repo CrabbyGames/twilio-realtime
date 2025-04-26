@@ -6,7 +6,7 @@ import websockets
 from fastapi import FastAPI, WebSocket, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.websockets import WebSocketDisconnect
-from twilio.twiml.voice_response import VoiceResponse, Connect, Say, Stream
+from twilio.twiml.voice_response import VoiceResponse, Connect, Say, Stream, Dial
 from twilio.rest import Client
 from dotenv import load_dotenv
 
@@ -19,11 +19,11 @@ TWILIO_AUTH_TOKEN = os.getenv('TWILIO_AUTH_TOKEN')
 PORT = int(os.getenv('PORT', 5050))
 SYSTEM_MESSAGE = (
     """
-    You are an AI agent. You work for Adam. 
-    You have to start each call by saying 'Hello, this is Adam Assistant. How can I help you today?'
+    You are an AI agent. You work for Adam. Your goal is to understand what's the goal of the conversation and detect if the other person is a scammer. 
     
-    Your goal is to understand what's the goal of the conversation and detect if the other person is a scammer. When you detect that the person what's to scam you say "Scam has been detected... this call has been recorded and will be send to authorities...
-    If you detect a scam hang up the phone.
+    When you detect that the person is trying to scam you, say "Scam has been detected... this call has been recorded and will be sent to authorities..." and then use the hangupCall tool to end the call.
+    
+    If the person asks to speak to Adam directly or needs urgent assistance, you can use the forwardCall tool to transfer the call to Adam's number.
 
     Today's Adam calendar:
     Work 8AM to 4PM
@@ -39,6 +39,7 @@ LOG_EVENT_TYPES = [
     'session.created', 'response.function_call_arguments.done'
 ]
 SHOW_TIMING_MATH = False
+ADAM_PHONE_NUMBER = os.getenv('ADAM_PHONE_NUMBER')  # Replace with actual number
 
 app = FastAPI()
 twilio_client = None
@@ -63,6 +64,46 @@ async def handle_incoming_call(request: Request):
     connect.stream(url=f'wss://{host}/media-stream')
     response.append(connect)
     return HTMLResponse(content=str(response), media_type="application/xml")
+
+# @app.api_route("/forward-call", methods=["GET", "POST"])
+# async def forward_call(request: Request):
+#     """Handle forwarding a call to another number."""
+#     form_data = await request.form()
+#     forward_to = form_data.get('forward_to', ADAM_PHONE_NUMBER)
+    
+#     response = VoiceResponse()
+#     response.say("Your call is being forwarded. Please hold.", voice="alice")
+#     response.dial(forward_to)
+    
+#     return HTMLResponse(content=str(response), media_type="application/xml")
+
+
+async def forward_call_to_number(call_sid, phone_number):
+    """Forward a call to another phone number."""
+    if not call_sid or not twilio_client:
+        print(f"Unable to forward call: call_sid={call_sid}, client_available={twilio_client is not None}")
+        return False
+    
+    try:
+        print(f"Forwarding call {call_sid} to {phone_number}")
+        
+        # Create a TwiML for call forwarding
+        response = VoiceResponse()
+        response.say("Your call is being forwarded to Adam. Please hold.", voice="alice")
+        response.dial(phone_number)
+        
+        twiml = str(response)
+        
+        # Update the call with the TwiML directly
+        call = twilio_client.calls(call_sid).update(
+            twiml=twiml
+        )
+        
+        print(f"Call forwarding TwiML applied directly to call {call_sid}")
+        return True
+    except Exception as e:
+        print(f"Error forwarding call: {e}")
+        return False
 
 @app.websocket("/media-stream")
 async def handle_media_stream(websocket: WebSocket):
@@ -150,6 +191,7 @@ async def handle_media_stream(websocket: WebSocket):
                     if response.get('type') == 'response.function_call_arguments.done':
                         function_name = response.get('name')
                         call_id = response.get('call_id')
+                        arguments = response.get('arguments', '{}')
                         
                         if function_name == 'hangupCall':
                             # Execute hangup logic
@@ -157,6 +199,25 @@ async def handle_media_stream(websocket: WebSocket):
                             
                             # Send function call result back to OpenAI
                             result = {"success": success}
+                            result_message = {
+                                "type": "conversation.item.create",
+                                "item": {
+                                    "type": "function_call_output",
+                                    "call_id": call_id,
+                                    "output": json.dumps(result)
+                                }
+                            }
+                            await openai_ws.send(json.dumps(result_message))
+                            await openai_ws.send(json.dumps({"type": "response.create"}))
+                        
+                        elif function_name == 'forwardCall':
+                            # Execute forward logic
+                            args = json.loads(arguments)
+                            forward_number = args.get('phoneNumber', ADAM_PHONE_NUMBER)
+                            success = await forward_call_to_number(call_sid, forward_number)
+                            
+                            # Send function call result back to OpenAI
+                            result = {"success": success, "forwardedTo": forward_number}
                             result_message = {
                                 "type": "conversation.item.create",
                                 "item": {
@@ -231,6 +292,38 @@ async def handle_media_stream(websocket: WebSocket):
             except Exception as e:
                 print(f"Error hanging up call: {e}")
                 return False
+                
+        async def forward_call_to_number(call_sid, phone_number):
+            """Forward a call to another phone number."""
+            if not call_sid or not twilio_client:
+                print(f"Unable to forward call: call_sid={call_sid}, client_available={twilio_client is not None}")
+                return False
+            
+            try:
+                print(f"Forwarding call {call_sid} to {phone_number}")
+                
+                # Method 1: Update call with a new URL that contains the forward logic
+                base_url = os.getenv('BASE_URL', 'https://your-app-url.com')
+                forward_url = f"{base_url}/forward-call?forward_to={phone_number}"
+                call = twilio_client.calls(call_sid).update(
+                    method='GET',
+                    url=forward_url
+                )
+
+                # Method 2: Create a new call and bridge them
+                # This is an alternative approach if the above doesn't work well
+                # new_call = twilio_client.calls.create(
+                #     to=phone_number,
+                #     from_='+YourTwilioNumber',  # Use your Twilio number
+                #     url=f"{base_url}/connect-calls?parent_call_sid={call_sid}",
+                #     method='GET'
+                # )
+                
+                print(f"Call forwarding initiated to {phone_number}")
+                return True
+            except Exception as e:
+                print(f"Error forwarding call: {e}")
+                return False
 
         await asyncio.gather(receive_from_twilio(), send_to_twilio())
 
@@ -244,7 +337,7 @@ async def send_initial_conversation_item(openai_ws):
             "content": [
                 {
                     "type": "input_text",
-                    "text": "Greet the user with 'Hello there! I am an AI voice assistant powered by Twilio and the OpenAI Realtime API. You can ask me for facts, jokes, or anything you can imagine. How can I help you?'"
+                    "text": "Greet the user with 'Hello there! I am Adam's AI assistant. How can I help you today?'"
                 }
             ]
         }
@@ -275,6 +368,21 @@ async def initialize_session(openai_ws):
                         "properties": {},
                         "required": []
                     }
+                },
+                {
+                    "type": "function",
+                    "name": "forwardCall",
+                    "description": "Forward the current call to Adam's phone number or a specified number",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "phoneNumber": {
+                                "type": "string",
+                                "description": "The phone number to forward the call to. Default is Adam's number if not provided."
+                            }
+                        },
+                        "required": []
+                    }
                 }
             ]
         }
@@ -283,7 +391,7 @@ async def initialize_session(openai_ws):
     await openai_ws.send(json.dumps(session_update))
 
     # Uncomment the next line to have the AI speak first
-    # await send_initial_conversation_item(openai_ws)
+    await send_initial_conversation_item(openai_ws)
 
 if __name__ == "__main__":
     import uvicorn
